@@ -239,6 +239,13 @@ def test_zeroext_extract_comparing_against_constant_simplifier():
     expr = claripy.Extract(31, 8, claripy.Concat(claripy.BVV(0, 24), dd)) == claripy.BVV(0xffff, 24)
     assert expr is not (dd == claripy.BVV(0xffff, 23))
 
+def test_one_xor_exp_eq_zero():
+    var1 = claripy.FPV(150, claripy.fp.FSORT_DOUBLE)
+    var2 = claripy.FPS("test", claripy.fp.FSORT_DOUBLE)
+    result = var1 <= var2
+    expr = claripy.BVV(1,1) ^ (claripy.If(result, claripy.BVV(1, 1), claripy.BVV(0, 1))) == claripy.BVV(0,1)
+
+    nose.tools.assert_is(claripy.simplify(expr),result)
 
 def perf():
     import timeit  # pylint:disable=import-outside-toplevel
@@ -260,3 +267,4 @@ if __name__ == '__main__':
     test_mask_eq_constant()
     test_and_mask_comparing_against_constant_simplifier()
     test_zeroext_extract_comparing_against_constant_simplifier()
+    test_one_xor_exp_eq_zero()
