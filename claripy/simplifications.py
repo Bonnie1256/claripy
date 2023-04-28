@@ -23,6 +23,7 @@ class SimplificationManager:
             "__eq__": self.eq_simplifier,
             "__ne__": self.ne_simplifier,
             "__ge__": self.ge_simplifier,
+            "__le__": self.le_simplifier,
             "__or__": self.bitwise_or_simplifier,
             "__and__": self.bitwise_and_simplifier,
             "__xor__": self.bitwise_xor_simplifier,
@@ -211,6 +212,13 @@ class SimplificationManager:
             elif a.args[0].op == "BVV" and a.args[0].args[0] == 1:  # 1 ^ expr == 0
                 return a.args[1] == 1
 
+        # ~expr == 0    ->     expr == 1
+        if a.op == "__invert__" and b.op == "BVV" and b.args[0] == 0:
+            left = SimplificationManager.invert_simplifier(a.args[0])
+            if left is not None:
+                return left == 0
+            return None
+
         # TODO: all these ==/!= might really slow things down...
         if a.op == "If":
             if a.args[1] is b and ast.all_operations.is_true(a.args[2] != b):
@@ -335,6 +343,13 @@ class SimplificationManager:
     def ge_simplifier(a, b):
         # ZeroExt/Concat and comparing against a constant
         simp = SimplificationManager.zeroext_comparing_against_simplifier(operator.__ge__, a, b)
+        if simp is not None:
+            return simp
+
+    @staticmethod
+    def le_simplifier(a, b):
+        # ZeroExt/Concat and comparing against a constant
+        simp = SimplificationManager.zeroext_comparing_against_simplifier(operator.__le__, a, b)
         if simp is not None:
             return simp
 
@@ -993,6 +1008,7 @@ class SimplificationManager:
         # ~ if(cond then 1 else 0)  ->  if(cond, ~1, ~0)  ->    if(!cond, 1,0)
         if expr.op == "If" and expr.args[1].op == "BVV" and expr.args[1].args[0] == 1 and expr.args[2].args[0] == 0:
             return ast.bool.If(ast.all_operations.Not(expr.args[0]), expr.args[1], expr.args[2])
+        return None
 
     @staticmethod
     def and_mask_comparing_against_constant_simplifier(op, a, b):
@@ -1110,7 +1126,7 @@ class SimplificationManager:
         If the high bits of b are all zeros (in case of ==, !=, and >=) or have at least one ones (in case of !=),
         ZeroExt can be eliminated.
         """
-        if op in {operator.__eq__, operator.__ne__, operator.__ge__} and b.op == "BVV":
+        if op in {operator.__eq__, operator.__ne__, operator.__ge__, operator.__le__} and b.op == "BVV":
             if a.op == "ZeroExt":
                 # check if the high bits of b are zeros
                 a_zeroext_bits = a.args[0]
