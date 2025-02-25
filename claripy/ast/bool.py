@@ -1,32 +1,28 @@
 from __future__ import annotations
 
-import atexit
 import logging
-from contextlib import suppress
+from functools import lru_cache
+from typing import TYPE_CHECKING, TypeVar, overload
 
+import claripy
 from claripy import operations
-from claripy.ast.base import ASTCacheKey, Base, _make_name
-from claripy.backend_manager import backends
-from claripy.errors import BackendError, ClaripyOperationError, ClaripyTypeError
+from claripy.algorithm.bool_check import is_false, is_true
+from claripy.ast.base import Base, _make_name
+from claripy.errors import ClaripyTypeError
 
 from .bits import Bits
 
-l = logging.getLogger("claripy.ast.bool")
+if TYPE_CHECKING:
+    from .bv import BV
+    from .fp import FP
 
-_boolv_cache = {}
-
-
-# This is a hilarious hack to get around some sort of bug in z3's python bindings, where
-# under some circumstances stuff gets destructed out of order
-def cleanup():
-    global _boolv_cache  # pylint:disable=global-variable-not-assigned
-    del _boolv_cache
-
-
-atexit.register(cleanup)
+T = TypeVar("T", bound=Base)
+log = logging.getLogger(__name__)
 
 
 class Bool(Base):
+    """Bool is the AST class for a boolean value."""
+
     __slots__ = ()
 
     @staticmethod
@@ -67,21 +63,18 @@ def BoolS(name, explicit_name=None) -> Bool:
     return Bool("BoolS", (n,), variables=frozenset((n,)), symbolic=True)
 
 
+@lru_cache(maxsize=2)
 def BoolV(val) -> Bool:
-    try:
-        return _boolv_cache[(val)]
-    except KeyError:
-        result = Bool("BoolV", (val,))
-        _boolv_cache[val] = result
-        return result
+    return Bool("BoolV", (val,))
 
 
-#
-# some standard ASTs
-#
+def true():
+    return BoolV(True)
 
-true = BoolV(True)
-false = BoolV(False)
+
+def false():
+    return BoolV(False)
+
 
 #
 # Bound operations
@@ -97,12 +90,19 @@ Bool.intersection = operations.op("intersection", (Bool, Bool), Bool)
 #
 
 
-def If(*args):
-    # the coercion here is strange enough that we'll just implement it manually
-    if len(args) != 3:
-        raise ClaripyOperationError("invalid number of args passed to If")
+@overload
+def If(cond: bool | Bool, true_value: bool | Bool, false_value: bool | Bool) -> Bool: ...
+@overload
+def If(cond: bool | Bool, true_value: int | BV, false_value: int | BV) -> BV: ...
+@overload
+def If(cond: bool | Bool, true_value: float | FP, false_value: float | FP) -> FP: ...
+@overload
+def If(cond: bool | Bool, true_value: T, false_value: T) -> T: ...
 
-    args = list(args)
+
+def If(cond, true_value, false_value):
+    # the coercion here is strange enough that we'll just implement it manually
+    args = [cond, true_value, false_value]
 
     if isinstance(args[0], bool):
         args[0] = BoolV(args[0])
@@ -147,9 +147,9 @@ def If(*args):
 
     if args[1] is args[2]:
         return args[1]
-    if args[1] is true and args[2] is false:
+    if args[1] is true() and args[2] is false():
         return args[0]
-    if args[1] is false and args[2] is true:
+    if args[1] is false() and args[2] is true():
         return ~args[0]
 
     if issubclass(ty, Bits):
@@ -168,22 +168,6 @@ Bool.__or__ = Or
 Bool.__ror__ = Or
 
 
-def is_true(e, exact=None):  # pylint:disable=unused-argument
-    with suppress(BackendError):
-        return backends.concrete.is_true(e)
-
-    l.debug("Unable to tell the truth-value of this expression")
-    return False
-
-
-def is_false(e, exact=None):  # pylint:disable=unused-argument
-    with suppress(BackendError):
-        return backends.concrete.is_false(e)
-
-    l.debug("Unable to tell the truth-value of this expression")
-    return False
-
-
 # For large tables, ite_dict that uses a binary search tree instead of a "linear" search tree.
 # This improves Z3 search capability (eliminating branches) and decreases recursion depth:
 # linear search trees make Z3 error out on tables larger than a couple hundred elements.)
@@ -195,8 +179,6 @@ def ite_dict(i, d, default):
     :param default: A default value that the expression should take on if `i` matches none of the keys of `d`
     :return: An expression encoding the result of the above
     """
-    i = i.ast if type(i) is ASTCacheKey else i
-
     # for small dicts fall back to the linear implementation
     if len(d) < 4:
         return ite_cases([(i == c, v) for c, v in d.items()], default)
@@ -238,7 +220,7 @@ def reverse_ite_cases(ast):
     :param ast:
     :return:
     """
-    queue = [(true, ast)]
+    queue = [(true(), ast)]
     while queue:
         condition, ast = queue.pop(0)
         if ast.op == "If":
@@ -259,19 +241,15 @@ def constraint_to_si(expr):
     satisfiable = True
     replace_list = []
 
-    satisfiable, replace_list = backends.vsa.constraint_to_si(expr)
+    satisfiable, replace_list = claripy.backends.vsa.constraint_to_si(expr)
 
     # Make sure the replace_list are all ast.bvs
     for i in range(len(replace_list)):  # pylint:disable=consider-using-enumerate
         ori, new = replace_list[i]
         if not isinstance(new, Base):
-            new = BVS(
+            new = claripy.BVS(
                 new.name, new._bits, min=new._lower_bound, max=new._upper_bound, stride=new._stride, explicit_name=True
             )
             replace_list[i] = (ori, new)
 
     return satisfiable, replace_list
-
-
-# pylint: disable=wrong-import-position
-from .bv import BVS  # noqa: E402

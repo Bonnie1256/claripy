@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import atexit
 import logging
 import numbers
 import weakref
@@ -9,27 +8,19 @@ from contextlib import suppress
 from typing_extensions import Self
 
 import claripy
-from claripy import operations, vsa
+from claripy import operations
 from claripy.ast.base import _make_name
 from claripy.errors import BackendError, ClaripyValueError
-from claripy.utils import deprecated
+from claripy.util import deprecated
 
 from .bits import Bits
 from .bool import Bool, If
 
-l = logging.getLogger("claripy.ast.bv")
+log = logging.getLogger(__name__)
 
 _bvv_cache = weakref.WeakValueDictionary()
 
-
-# This is a hilarious hack to get around some sort of bug in z3's python bindings, where
-# under some circumstances stuff gets destructed out of order
-def cleanup():
-    global _bvv_cache  # pylint:disable=global-variable-not-assigned
-    del _bvv_cache
-
-
-atexit.register(cleanup)
+# pylint: disable=too-many-positional-arguments
 
 
 class BV(Bits):
@@ -69,7 +60,7 @@ class BV(Bits):
         """
         s = len(self)
         if s % bits != 0:
-            raise ValueError("expression length (%d) should be a multiple of 'bits' (%d)" % (len(self), bits))
+            raise ValueError(f"expression length ({len(self)}) should be a multiple of 'bits' ({bits})")
         if s == bits:
             return [self]
         return list(reversed([self[(n + 1) * bits - 1 : n * bits] for n in range(s // bits)]))
@@ -92,15 +83,7 @@ class BV(Bits):
         :param index: the byte to extract
         :return: An 8-bit BV
         """
-        pos = (self.size() + 7) // 8 - 1 - index
-        if pos < 0:
-            raise ValueError(
-                "Incorrect index %d. Your index must be between %d and %d." % (index, 0, self.size() // 8 - 1)
-            )
-        r = self[min(pos * 8 + 7, self.size() - 1) : pos * 8]
-        if r.size() % 8 != 0:  # pylint:disable=no-member
-            r = r.zero_extend(8 - r.size() % 8)  # pylint:disable=no-member
-        return r
+        return self.get_bytes(index, 1)
 
     def get_bytes(self, index, size):
         """
@@ -112,9 +95,7 @@ class BV(Bits):
         """
         pos = (self.size() + 7) // 8 - 1 - index
         if pos < 0:
-            raise ValueError(
-                "Incorrect index %d. Your index must be between %d and %d." % (index, 0, self.size() // 8 - 1)
-            )
+            raise ValueError(f"Incorrect index {index}. Your index must be between 0 and {self.size() // 8 - 1}.")
         if size == 0:
             return BVV(0, 0)
         r = self[min(pos * 8 + 7, self.size() - 1) : (pos - size + 1) * 8]
@@ -151,7 +132,7 @@ class BV(Bits):
 
     @staticmethod
     def _from_int(like, value):
-        return BVV(value, like.length)
+        return BVV(value, like.length or 64)
 
     @staticmethod
     def _from_Bool(like, value):
@@ -163,7 +144,7 @@ class BV(Bits):
 
     @staticmethod
     def _from_str(like, value):  # pylint:disable=unused-argument
-        l.warning("BVV value is being coerced from a unicode string, encoding as utf-8")
+        log.warning("BVV value is being coerced from a unicode string, encoding as utf-8")
         value = value.encode("utf-8")
         return BVV(value)
 
@@ -181,11 +162,11 @@ class BV(Bits):
         :return:        An FP AST whose value is the same as this BV
         """
         if rm is None:
-            rm = fp.fp.RM.default()
+            rm = claripy.fp.RM.default()
         if sort is None:
-            sort = fp.fp.FSort.from_size(self.length)
+            sort = claripy.fp.FSort.from_size(self.length)
 
-        op = fp.fpToFP if signed else fp.fpToFPUnsigned
+        op = claripy.ast.fp.fpToFP if signed else claripy.ast.fp.fpToFPUnsigned
         return op(rm, self, sort)
 
     def raw_to_fp(self):
@@ -195,8 +176,8 @@ class BV(Bits):
 
         :return:        An FP AST whose bit-pattern is the same as this BV
         """
-        sort = fp.fp.FSort.from_size(self.length)
-        return fp.fpToFP(self, sort)
+        sort = claripy.fp.FSort.from_size(self.length)
+        return claripy.ast.fp.fpToFP(self, sort)
 
     def raw_to_bv(self):
         """
@@ -207,22 +188,16 @@ class BV(Bits):
     def to_bv(self):
         return self.raw_to_bv()
 
-    def identical(self, other: Self, strict=False) -> bool:
+    def identical(self, other: Self) -> bool:
         with suppress(BackendError):
             return claripy.backends.vsa.convert(self).identical(claripy.backends.vsa.convert(other))
-        return super().identical(other, strict)
+        return super().identical(other)
 
 
-def BVS(
+def BVS(  # pylint:disable=redefined-builtin
     name,
     size,
-    min=None,
-    max=None,
-    stride=None,
-    uninitialized=False,  # pylint:disable=redefined-builtin
     explicit_name=None,
-    discrete_set=False,
-    discrete_set_max_card=None,
     **kwargs,
 ) -> BV:
     """
@@ -233,40 +208,27 @@ def BVS(
 
     :param name:            The name of the symbol.
     :param size:            The size (in bits) of the bit-vector.
-    :param min:             The minimum value of the symbol, used only for value-set analysis
-    :param max:             The maximum value of the symbol, used only for value-set analysis
-    :param stride:          The stride of the symbol, used only for value-set analysis
-    :param uninitialized:   Whether this value should be counted as an "uninitialized" value in the course of an
-                            analysis.
     :param bool explicit_name:   If False, an identifier is appended to the name to ensure uniqueness.
-    :param bool discrete_set: If True, a DiscreteStridedIntervalSet will be used instead of a normal StridedInterval.
-    :param int discrete_set_max_card: The maximum cardinality of the discrete set. It is ignored if discrete_set is set
-                                      to False or None.
 
     :returns:               a BV object representing this symbol.
     """
-
-    if stride == 0 and max != min:
-        raise ClaripyValueError("BVSes of stride 0 should have max == min")
 
     if isinstance(name, bytes):
         name = name.decode()
     if not isinstance(name, str):
         raise TypeError(f"Name value for BVS must be a str, got {type(name)!r}")
+    if size is None or not isinstance(size, int):
+        raise TypeError("Size value for BVS must be an integer")
 
     n = _make_name(name, size, False if explicit_name is None else explicit_name)
     encoded_name = n.encode()
 
-    if not discrete_set:
-        discrete_set_max_card = None
-
     return BV(
         "BVS",
-        (n, min, max, stride, uninitialized, discrete_set, discrete_set_max_card),
+        (n, size),
         variables=frozenset((n,)),
         length=size,
         symbolic=True,
-        uninitialized=uninitialized,
         encoded_name=encoded_name,
         **kwargs,
     )
@@ -285,7 +247,7 @@ def BVV(value, size=None, **kwargs) -> BV:
 
     if type(value) in (bytes, bytearray, memoryview, str):
         if isinstance(value, str):
-            l.warning("BVV value is a unicode string, encoding as utf-8")
+            log.warning("BVV value is a unicode string, encoding as utf-8")
             value = value.encode("utf-8")
 
         if size is None:
@@ -317,39 +279,21 @@ def BVV(value, size=None, **kwargs) -> BV:
 
 
 def SI(
-    name=None,
+    name="unnamed",
     bits=0,
     lower_bound=None,
     upper_bound=None,
     stride=None,
-    to_conv=None,
     explicit_name=None,
-    discrete_set=False,
-    discrete_set_max_card=None,
 ):
-    name = "unnamed" if name is None else name
-    if to_conv is not None:
-        si = vsa.CreateStridedInterval(
-            name=name, bits=bits, lower_bound=lower_bound, upper_bound=upper_bound, stride=stride, to_conv=to_conv
-        )
-        return BVS(
-            name, si._bits, min=si._lower_bound, max=si._upper_bound, stride=si._stride, explicit_name=explicit_name
-        )
-    return BVS(
-        name,
-        bits,
-        min=lower_bound,
-        max=upper_bound,
-        stride=stride,
-        explicit_name=explicit_name,
-        discrete_set=discrete_set,
-        discrete_set_max_card=discrete_set_max_card,
+    return BVS(name, bits, explicit_name=explicit_name).annotate(
+        claripy.annotation.StridedIntervalAnnotation(stride, lower_bound, upper_bound)
     )
 
 
-def TSI(bits, name=None, uninitialized=False, explicit_name=None):
+def TSI(bits, name=None, explicit_name=None):
     name = "unnamed" if name is None else name
-    return BVS(name, bits, uninitialized=uninitialized, explicit_name=explicit_name)
+    return BVS(name, bits, explicit_name=explicit_name)
 
 
 def ESI(bits, **kwargs):
@@ -364,61 +308,39 @@ def ValueSet(bits, region=None, region_base_addr=None, value=None, name=None, va
         region_base_addr = 0
 
     v = region_base_addr + value
+    if isinstance(v, claripy.ast.Base):
+        v = claripy.simplify(v)
 
     # Backward compatibility
     if isinstance(v, numbers.Number):
         min_v, max_v = v, v
         stride = 0
-    elif isinstance(v, vsa.StridedInterval):
-        min_v, max_v = v.lower_bound, v.upper_bound
-        stride = v.stride
     elif isinstance(v, claripy.ast.Base):
-        sv = claripy.simplify(v)
-        if sv.op == "BVS":
-            min_v = sv.args[1]
-            max_v = sv.args[2]
-            stride = sv.args[3]
+        si_anno = v.get_annotation(claripy.annotation.StridedIntervalAnnotation)
+        if si_anno is not None:
+            min_v = si_anno.lower_bound
+            max_v = si_anno.upper_bound
+            stride = si_anno.stride
+        elif v.op == "BVV":
+            min_v = v.args[0]
+            max_v = v.args[0]
+            stride = 0
         else:
-            raise ClaripyValueError(f"ValueSet() does not take `value` ast with op {sv.op}")
+            raise ClaripyValueError(f"ValueSet() does not take `value` ast with op {v.op}")
     else:
         raise ClaripyValueError(f"ValueSet() does not take `value` of type {type(value)}")
 
     if name is None:
         name = "ValueSet"
-    bvs = BVS(name, bits, min=region_base_addr + min_v, max=region_base_addr + max_v, stride=stride)
+    bvs = BVS(name, bits).annotate(
+        claripy.annotation.StridedIntervalAnnotation(stride, region_base_addr + min_v, region_base_addr + max_v)
+    )
 
     # Annotate the bvs and return the new AST
     return bvs.annotate(claripy.annotation.RegionAnnotation(region, region_base_addr, value))
 
 
 VS = ValueSet
-
-
-def DSIS(
-    name=None, bits=0, lower_bound=None, upper_bound=None, stride=None, explicit_name=None, to_conv=None, max_card=None
-):
-    if to_conv is not None:
-        si = vsa.CreateStridedInterval(bits=to_conv.size(), to_conv=to_conv)
-        return SI(
-            name=name,
-            bits=si._bits,
-            lower_bound=si._lower_bound,
-            upper_bound=si._upper_bound,
-            stride=si._stride,
-            explicit_name=explicit_name,
-            discrete_set=True,
-            discrete_set_max_card=max_card,
-        )
-    return SI(
-        name=name,
-        bits=bits,
-        lower_bound=lower_bound,
-        upper_bound=upper_bound,
-        stride=stride,
-        explicit_name=explicit_name,
-        discrete_set=True,
-        discrete_set_max_card=max_card,
-    )
 
 
 #
@@ -624,5 +546,3 @@ BV.widen = operations.op(
 BV.intersection = operations.op(
     "intersection", (BV, BV), BV, extra_check=operations.length_same_check, calc_length=operations.basic_length_calc
 )
-
-from . import fp  # noqa: E402

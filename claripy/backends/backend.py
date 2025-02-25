@@ -5,10 +5,9 @@ import logging
 import numbers
 import operator
 import threading
-import weakref
 from contextlib import suppress
 
-from claripy.ast.base import Base, SimplificationLevel
+from claripy.ast import Base
 from claripy.errors import BackendError, BackendUnsupportedError, ClaripyRecursionError
 
 log = logging.getLogger(__name__)
@@ -55,14 +54,16 @@ class Backend:
     _convert() to see if the backend can handle that type of object.
     """
 
+    # pylint: disable=too-many-positional-arguments
+
     __slots__ = (
-        "_op_raw",
-        "_op_expr",
         "_cache_objects",
+        "_false_cache",
+        "_op_expr",
+        "_op_raw",
         "_solver_required",
         "_tls",
         "_true_cache",
-        "_false_cache",
     )
 
     def __init__(self, solver_required=None):
@@ -72,19 +73,15 @@ class Backend:
         self._solver_required = solver_required is not None
 
         self._tls = threading.local()
-        self._true_cache = weakref.WeakKeyDictionary()
-        self._false_cache = weakref.WeakKeyDictionary()
-
-    @property
-    def is_smt_backend(self):
-        return False
+        self._true_cache = {}
+        self._false_cache = {}
 
     @property
     def _object_cache(self):
         try:
             return self._tls.object_cache
         except AttributeError:
-            self._tls.object_cache = weakref.WeakKeyDictionary()
+            self._tls.object_cache = {}
             return self._tls.object_cache
 
     def _make_raw_ops(self, op_list, op_dict=None, op_module=None):
@@ -184,7 +181,7 @@ class Backend:
                         )
 
                     if self._cache_objects:
-                        cached_obj = self._object_cache.get(ast._cache_key, None)
+                        cached_obj = self._object_cache.get(ast.hash(), None)
                         if cached_obj is not None:
                             arg_queue.append(cached_obj)
                             continue
@@ -218,7 +215,7 @@ class Backend:
                             r = self.apply_annotation(r, a)
 
                         if self._cache_objects:
-                            self._object_cache[ast._cache_key] = r
+                            self._object_cache[ast.hash()] = r
 
                         arg_queue.append(r)
 
@@ -298,13 +295,8 @@ class Backend:
     # These functions simplify expressions.
     #
 
-    def simplify(self, e):
-        o = self._abstract(self._simplify(self.convert(e)))
-        o._simplified = SimplificationLevel.FULL_SIMPLIFY
-        return o
-
-    def _simplify(self, e):  # pylint:disable=R0201,unused-argument
-        raise BackendError(f"backend {self.__class__.__name__} can't simplify")
+    def simplify(self, expr):
+        return self._abstract(self.convert(expr))
 
     #
     # Some other helpers
@@ -329,15 +321,15 @@ class Backend:
             )
 
         try:
-            return self._true_cache[e.cache_key]
+            return self._true_cache[e.hash()]
         except KeyError:
             t = self._is_true(
                 self.convert(e), extra_constraints=extra_constraints, solver=solver, model_callback=model_callback
             )
             if len(extra_constraints) == 0:  # Only update cache when we have no extra constraints
-                self._true_cache[e.cache_key] = t
+                self._true_cache[e.hash()] = t
                 if t is True:
-                    self._false_cache[e.cache_key] = False
+                    self._false_cache[e.hash()] = False
             return t
 
     def is_false(self, e, extra_constraints=(), solver=None, model_callback=None):  # pylint:disable=unused-argument
@@ -358,15 +350,15 @@ class Backend:
             )
 
         try:
-            return self._false_cache[e.cache_key]
+            return self._false_cache[e.hash()]
         except KeyError:
             f = self._is_false(
                 self.convert(e), extra_constraints=extra_constraints, solver=solver, model_callback=model_callback
             )
             if len(extra_constraints) == 0:  # Only update cache when we have no extra constraints
-                self._false_cache[e.cache_key] = f
+                self._false_cache[e.hash()] = f
                 if f is True:
-                    self._true_cache[e.cache_key] = False
+                    self._true_cache[e.hash()] = False
             return f
 
     def _is_false(
@@ -786,7 +778,7 @@ class Backend:
         """
         raise BackendError("backend doesn't support name()")
 
-    def identical(self, a, b):
+    def identical(self, a, b) -> bool:
         """
         This should return whether `a` is identical to `b`. Of course, this isn't always clear. True should mean that it
         is definitely identical. False eans that, conservatively, it might not be.
@@ -796,7 +788,7 @@ class Backend:
         """
         return self._identical(self.convert(a), self.convert(b))
 
-    def _identical(self, a, b):  # pylint:disable=no-self-use,unused-argument
+    def _identical(self, a, b) -> bool:  # pylint:disable=no-self-use,unused-argument
         """
         This should return whether `a` is identical to `b`. This is the native version of ``identical()``.
 
@@ -815,7 +807,7 @@ class Backend:
         """
         return self._cardinality(self.convert(a))
 
-    def _cardinality(self, b):  # pylint:disable=no-self-use,unused-argument
+    def _cardinality(self, a):  # pylint:disable=no-self-use,unused-argument
         """
         This should return the maximum number of values that an expression can take on. This should be a strict
         *over* approximation.

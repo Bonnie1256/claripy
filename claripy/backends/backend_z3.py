@@ -11,15 +11,13 @@ import threading
 import weakref
 from decimal import Decimal
 from functools import reduce
+from typing import TYPE_CHECKING
 
 import z3
 from cachetools import LRUCache
 
-from claripy.ast.base import SimplificationLevel
-from claripy.ast.bool import Bool, BoolV
-from claripy.ast.bv import BV, BVV
-from claripy.ast.fp import FP, FPV
-from claripy.ast.strings import StringV
+import claripy
+from claripy.ast import BV, FP, Bool
 from claripy.backends.backend import Backend
 from claripy.errors import (
     BackendError,
@@ -31,11 +29,16 @@ from claripy.errors import (
 from claripy.fp import RM, FSort
 from claripy.operations import backend_fp_operations, backend_operations, backend_strings_operations, bound_ops
 
-l = logging.getLogger("claripy.backends.backend_z3")
+if TYPE_CHECKING:
+    from claripy.annotation import Annotation
+
+
+log = logging.getLogger(__name__)
 
 # pylint:disable=unidiomatic-typecheck
 
 ALL_Z3_CONTEXTS = weakref.WeakSet()
+INT_STRING_CHUNK_SIZE: int | None = None  # will be updated later if we are on CPython 3.11+
 
 
 def handle_sigint(signals, frametype):
@@ -95,6 +98,82 @@ def _add_memory_pressure(p):
         __pypy__.add_memory_pressure(p)
 
 
+def int_to_str_unlimited(v: int) -> str:
+    """
+    Convert an integer to a decimal string, without any size limit.
+
+    :param v: The integer to convert.
+    :return: The string.
+    """
+
+    if INT_STRING_CHUNK_SIZE is None:
+        return str(v)
+
+    if v == 0:
+        return "0"
+
+    MOD = 10**INT_STRING_CHUNK_SIZE
+    v_str = ""
+    if v < 0:
+        is_negative = True
+        v = -v
+    else:
+        is_negative = False
+    while v > 0:
+        v_chunk = str(v % MOD)
+        v //= MOD
+        if v > 0:
+            v_chunk = v_chunk.zfill(INT_STRING_CHUNK_SIZE)
+        v_str = v_chunk + v_str
+    return v_str if not is_negative else "-" + v_str
+
+
+def Z3_to_int_str(val):
+    # we will monkey-patch Z3 and replace Z3._to_int_str with this version, which is free of integer size limits.
+
+    if isinstance(val, float):
+        return str(int(val))
+    if isinstance(val, bool):
+        return "1" if val else "0"
+    return int_to_str_unlimited(val)
+
+
+if hasattr(sys, "get_int_max_str_digits"):
+    # CPython 3.11+
+    # monkey-patch Z3 so that it can accept long integers
+    z3.z3._to_int_str = Z3_to_int_str
+    # update INT_STRING_CHUNK_SIZE
+    INT_STRING_CHUNK_SIZE = sys.get_int_max_str_digits()
+
+
+def str_to_int_unlimited(s: str) -> int:
+    """
+    Convert a decimal string to an integer, without any size limit.
+
+    :param s: The string to convert.
+    :return: The integer.
+    """
+    if INT_STRING_CHUNK_SIZE is None:
+        return int(s)
+
+    if not s:
+        return int(s)  # an exception will be raised, which is intentional
+
+    v = 0
+    if s[0] == "-":
+        is_negative = True
+        s = s[1:]
+    else:
+        is_negative = False
+
+    for i in range(0, len(s), INT_STRING_CHUNK_SIZE):
+        start = i
+        end = min(i + INT_STRING_CHUNK_SIZE, len(s))
+        v *= 10 ** (end - start)
+        v += int(s[start:end], 10)
+    return v if not is_negative else -v
+
+
 #
 # Some global variables
 #
@@ -126,7 +205,7 @@ def _z3_decl_name_str(ctx, decl):
 
 
 def z3_solver_sat(solver, extra_constraints, occasion):
-    l.debug("Doing a check! (%s)", occasion)
+    log.debug("Doing a check! (%s)", occasion)
 
     result = solver.check(extra_constraints)
 
@@ -210,17 +289,12 @@ class BackendZ3(Backend):
 
         self.solve_count = 0
 
-    # XXX this is a HUGE HACK that should be removed whenever uninitialized gets moved to the
-    # "proposed annotation backend" or wherever will prevent it from being part of the object
-    # identity. also whenever the VSA attributes get the fuck out of BVS as well
+    # This is necessary to be able to carry over annotations when round-tripping through Z3
     @property
-    def extra_bvs_data(self):
-        try:
-            return self._tls.extra_bvs_data
-        except AttributeError:
-            # a pointer to get values out of Z3
-            self._tls.extra_bvs_data = {}
-            return self._tls.extra_bvs_data
+    def bvs_annotations(self) -> dict[bytes, tuple[Annotation, ...]]:
+        if not hasattr(self._tls, "bvs_annotations"):
+            self._tls.bvs_annotations = {}
+        return self._tls.bvs_annotations
 
     @property
     def _c_uint64_p(self):
@@ -290,7 +364,7 @@ class BackendZ3(Backend):
         self._sym_cache.clear()
 
     def _name(self, o):  # pylint:disable=unused-argument
-        l.warning("BackendZ3.name() called. This is weird.")
+        log.warning("BackendZ3.name() called. This is weird.")
         raise BackendError("name is not implemented yet")
 
     def _pop_from_ast_cache(self, _, tpl):
@@ -304,10 +378,7 @@ class BackendZ3(Backend):
     @condom
     def BVS(self, ast):
         name = ast._encoded_name
-        if hasattr(ast, "annotations"):
-            self.extra_bvs_data[name] = (ast.args, ast.annotations)
-        else:
-            self.extra_bvs_data[name] = (ast.args, None)
+        self.bvs_annotations[name] = ast.annotations
         size = ast.size()
         # TODO: Here we can use low level APIs because the check performed by the high level API always results in
         #       the else branch of the check. This evidence although comes from the execution of the angr and claripy
@@ -316,12 +387,6 @@ class BackendZ3(Backend):
         return z3.BitVecRef(
             z3.Z3_mk_const(self._context.ref(), z3.to_symbol(name, self._context), bv.ast), self._context
         )
-        # if mn is not None:
-        #    expr = z3.If(z3.ULT(expr, mn), mn, expr, ctx=self._context)
-        # if mx is not None:
-        #    expr = z3.If(z3.UGT(expr, mx), mx, expr, ctx=self._context)
-        # if stride is not None:
-        #    expr = (expr // stride) * stride
 
     @condom
     def BVV(self, ast):
@@ -377,12 +442,10 @@ class BackendZ3(Backend):
 
     @condom
     def StringV(self, ast):
-        return z3.StringVal(ast.args[0].ljust(ast.args[1], "\0"), ctx=self._context)
+        return z3.StringVal(ast.args[0], ctx=self._context)
 
     @condom
     def StringS(self, ast):
-        # Maybe this should be an error? Warning for now to support reliant code
-        l.warning("Converting claripy StringS' to z3 looses length information.")
         return z3.String(ast.args[0], ctx=self._context)
 
     #
@@ -411,7 +474,7 @@ class BackendZ3(Backend):
             return z3.BoolRef(z3.Z3_mk_false(self._context.ref()), self._context)
         if isinstance(obj, numbers.Number | str) or (hasattr(obj, "__module__") and obj.__module__ in ("z3", "z3.z3")):
             return obj
-        l.debug("BackendZ3 encountered unexpected type %s", type(obj))
+        log.debug("BackendZ3 encountered unexpected type %s", type(obj))
         raise BackendError(f"unexpected type {type(obj)} encountered in BackendZ3")
 
     def call(self, *args, **kwargs):  # pylint;disable=arguments-renamed
@@ -445,7 +508,7 @@ class BackendZ3(Backend):
         z3_sort = z3.Z3_get_sort(ctx, ast)
 
         if decl_num not in z3_op_nums:
-            raise ClaripyError("unknown decl kind %d" % decl_num)
+            raise ClaripyError(f"unknown decl kind {decl_num}")
         if op_map.get(z3_op_nums[decl_num], None) is None:
             raise ClaripyError(f"unknown decl op {z3_op_nums[decl_num]}")
         op_name = op_map[z3_op_nums[decl_num]]
@@ -458,25 +521,31 @@ class BackendZ3(Backend):
         append_children = True
 
         if op_name == "True":
-            return BoolV(True)
+            return claripy.true()
         if op_name == "False":
-            return BoolV(False)
+            return claripy.false()
         if op_name.startswith("RM_"):
             return RM(op_name)
         if op_name == "INTERNAL":
-            return StringV(z3.SeqRef(ast).as_string())
+            return claripy.StringV(z3.SeqRef(ast).as_string())
         if op_name == "BitVecVal":
             bv_size = z3.Z3_get_bv_sort_size(ctx, z3_sort)
             if z3.Z3_get_numeral_uint64(ctx, ast, self._c_uint64_p):
-                return BVV(self._c_uint64_p.contents.value, bv_size)
-            bv_num = int(z3.Z3_get_numeral_string(ctx, ast))
-            return BVV(bv_num, bv_size)
+                return claripy.BVV(self._c_uint64_p.contents.value, bv_size)
+            bv_num = str_to_int_unlimited(z3.Z3_get_numeral_string(ctx, ast))
+            return claripy.BVV(bv_num, bv_size)
         if op_name in ("FPVal", "MinusZero", "MinusInf", "PlusZero", "PlusInf", "NaN"):
             ebits = z3.Z3_fpa_get_ebits(ctx, z3_sort)
             sbits = z3.Z3_fpa_get_sbits(ctx, z3_sort)
             sort = FSort.from_params(ebits, sbits)
             val = self._abstract_fp_val(ctx, ast, op_name)
-            return FPV(val, sort)
+            return claripy.FPV(val, sort)
+        if op_name == "fpToUBV":
+            bv_size = z3.Z3_get_bv_sort_size(ctx, z3_sort)
+            return claripy.fpToUBV(*children, bv_size)
+        if op_name == "fpToSBV":
+            bv_size = z3.Z3_get_bv_sort_size(ctx, z3_sort)
+            return claripy.fpToSBV(*children, bv_size)
 
         if op_name == "UNINTERPRETED" and num_args == 0:  # symbolic value
             symbol_name = _z3_decl_name_str(ctx, decl)
@@ -485,35 +554,22 @@ class BackendZ3(Backend):
 
             if symbol_ty == z3.Z3_BV_SORT:
                 bv_size = z3.Z3_get_bv_sort_size(ctx, z3_sort)
-                (ast_args, annots) = self.extra_bvs_data.get(symbol_name, (None, None))
-                if ast_args is None:
-                    ast_args = (symbol_str, None, None, None, False, False, None)
-
-                return BV(
-                    "BVS",
-                    ast_args,
-                    length=bv_size,
-                    variables=frozenset((symbol_str,)),
-                    symbolic=True,
-                    encoded_name=symbol_name,
-                    annotations=annots,
-                )
+                annots = self.bvs_annotations.get(symbol_name, ())
+                return claripy.BVS(symbol_str, bv_size, explicit_name=True, annotations=annots)
             if symbol_ty == z3.Z3_BOOL_SORT:
-                return Bool("BoolS", (symbol_str,), variables=frozenset((symbol_str,)), symbolic=True)
+                return claripy.BoolS(symbol_str, explicit_name=True)
             if symbol_ty == z3.Z3_FLOATING_POINT_SORT:
                 ebits = z3.Z3_fpa_get_ebits(ctx, z3_sort)
                 sbits = z3.Z3_fpa_get_sbits(ctx, z3_sort)
                 sort = FSort.from_params(ebits, sbits)
-                return FP(
-                    "FPS", (symbol_str, sort), variables=frozenset((symbol_str,)), symbolic=True, length=sort.length
-                )
+                return claripy.FPS(symbol_str, sort, explicit_name=True)
             if z3.Z3_is_string_sort(ctx, z3_sort):
                 raise BackendError("Z3 backend does not support string symbols")
-            raise BackendError("Unknown z3 term type %d...?" % symbol_ty)
+            raise BackendError(f"Unknown z3 term type {symbol_ty}...?")
 
         if op_name == "UNINTERPRETED":
             mystery_name = z3.Z3_get_symbol_string(ctx, z3.Z3_get_decl_name(ctx, decl))
-            l.error("Mystery operation %s in BackendZ3._abstract_internal. Please report this.", mystery_name)
+            log.error("Mystery operation %s in BackendZ3._abstract_internal. Please report this.", mystery_name)
         elif op_name == "Extract":
             hi = z3.Z3_get_decl_int_parameter(ctx, decl, 0)
             lo = z3.Z3_get_decl_int_parameter(ctx, decl, 1)
@@ -526,11 +582,6 @@ class BackendZ3(Backend):
             mantissa = z3.Z3_fpa_get_sbits(ctx, z3_sort)
             sort = FSort.from_params(exp, mantissa)
             args = [*children, sort]
-            append_children = False
-        elif op_name in ("fpToSBV", "fpToUBV"):
-            # uuuuuugggggghhhhhh
-            bv_size = z3.Z3_get_bv_sort_size(ctx, z3_sort)
-            args = [*children, bv_size]
             append_children = False
         else:
             args = []
@@ -547,7 +598,7 @@ class BackendZ3(Backend):
                 f"Unknown Z3 error in abstraction (result_ty == '{result_ty}'). "
                 "Update your version of Z3, and, if the problem persists, open a claripy issue."
             )
-            l.error(err)
+            log.error(err)
             raise BackendError(err)
 
         if op_name == "If":
@@ -577,7 +628,7 @@ class BackendZ3(Backend):
         decl_num = z3.Z3_get_decl_kind(ctx, decl)
 
         if decl_num not in z3_op_nums:
-            raise ClaripyError("unknown decl kind %d" % decl_num)
+            raise ClaripyError(f"unknown decl kind {decl_num}")
         if op_map.get(z3_op_nums[decl_num], None) is None:
             raise ClaripyError(f"unknown decl op {z3_op_nums[decl_num]}")
         op_name = op_map[z3_op_nums[decl_num]]
@@ -633,7 +684,7 @@ class BackendZ3(Backend):
     def _abstract_bv_val(self, ctx, ast):
         if z3.Z3_get_numeral_uint64(ctx, ast, self._c_uint64_p):
             return self._c_uint64_p.contents.value
-        return int(z3.Z3_get_numeral_string(ctx, ast))
+        return str_to_int_unlimited(z3.Z3_get_numeral_string(ctx, ast))
 
     @staticmethod
     def _abstract_fp_val(ctx, ast, op_name):
@@ -777,7 +828,7 @@ class BackendZ3(Backend):
     def _satisfiable(self, extra_constraints=(), solver=None, model_callback=None):
         self.solve_count += 1
 
-        l.debug("Doing a check! (satisfiable)")
+        log.debug("Doing a check! (satisfiable)")
         if not z3_solver_sat(solver, extra_constraints, "satisfiable"):
             return False
 
@@ -864,11 +915,11 @@ class BackendZ3(Backend):
             sat = z3_solver_sat(solver, constraints, comment)
             constraints.pop()
             if sat:
-                l.debug("... still sat")
+                log.debug("... still sat")
                 if model_callback is not None:
                     model_callback(self._generic_model(solver.model()))
             else:
-                l.debug("... now unsat")
+                log.debug("... now unsat")
             if sat == is_max:
                 lo = middle
             else:
@@ -888,40 +939,17 @@ class BackendZ3(Backend):
     def _max(self, expr, extra_constraints=(), signed=False, solver=None, model_callback=None):
         return self._extrema(True, expr, extra_constraints, signed, solver, model_callback)
 
-    def _simplify(self, e):  # pylint:disable=W0613,R0201
-        raise Exception("This shouldn't be called. Bug Yan.")
-
     @condom
-    def simplify(self, expr):  # pylint:disable=arguments-renamed
-        if expr._simplified:
-            return expr
-
-        # l.debug("SIMPLIFYING EXPRESSION")
-
+    def simplify(self, expr):
         expr_raw = self.convert(expr)
 
-        # l.debug("... before:\n%s", z3_expr_to_smt2(expr_raw))
-
-        # s = expr_raw
         if isinstance(expr_raw, z3.BoolRef):
             boolref_tactics = self._boolref_tactics
-            s = boolref_tactics(expr_raw).as_expr()
-            # n = s.decl().name()
-            # if n == 'true':
-            #    s = True
-            # elif n == 'false':
-            #    s = False
-        elif isinstance(expr_raw, z3.BitVecRef):
-            s = z3.simplify(expr_raw)
+            simplified = boolref_tactics(expr_raw).as_expr()
         else:
-            s = expr_raw
+            simplified = z3.simplify(expr_raw)
 
-        # l.debug("... after:\n%s", z3_expr_to_smt2(s))
-
-        o = self._abstract(s)
-        o._simplified = SimplificationLevel.FULL_SIMPLIFY
-
-        return o
+        return self._abstract(simplified)
 
     def _is_false(self, e, extra_constraints=(), solver=None, model_callback=None):
         return z3.simplify(e).eq(z3.BoolVal(False, ctx=self._context))
@@ -1059,6 +1087,10 @@ class BackendZ3(Backend):
     @condom
     def _op_raw_fpEQ(self, a, b):
         return z3.BoolRef(z3.Z3_mk_fpa_eq(self._context.ref(), a.as_ast(), b.as_ast()), self._context)
+
+    @condom
+    def _op_raw_fpNEQ(self, a, b):
+        return z3.Not(z3.BoolRef(z3.Z3_mk_fpa_eq(self._context.ref(), a.as_ast(), b.as_ast()), self._context))
 
     @condom
     def _op_raw_fpIsNaN(self, a):
@@ -1231,8 +1263,8 @@ class BackendZ3(Backend):
 
     @staticmethod
     @condom
-    def _op_raw_StrLen(input_string, bitlength):
-        return z3.Int2BV(z3.Length(input_string), bitlength)
+    def _op_raw_StrLen(input_string):
+        return z3.Int2BV(z3.Length(input_string), 64)
 
     @staticmethod
     @condom
@@ -1256,13 +1288,13 @@ class BackendZ3(Backend):
 
     @staticmethod
     @condom
-    def _op_raw_StrIndexOf(string, pattern, start_idx, bitlength):
-        return z3.Int2BV(z3.IndexOf(string, pattern, z3.BV2Int(start_idx)), bitlength)
+    def _op_raw_StrIndexOf(string, pattern, start_idx):
+        return z3.Int2BV(z3.IndexOf(string, pattern, z3.BV2Int(start_idx)), 64)
 
     @staticmethod
     @condom
-    def _op_raw_StrToInt(input_string, bitlength):
-        return z3.Int2BV(z3.StrToInt(input_string), bitlength)
+    def _op_raw_StrToInt(input_string):
+        return z3.Int2BV(z3.StrToInt(input_string), 64)
 
     @staticmethod
     @condom

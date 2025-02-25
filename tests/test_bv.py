@@ -4,7 +4,7 @@ from __future__ import annotations
 import unittest
 
 import claripy
-from claripy.bv import BVV, Concat, Extract, SDiv, SignExt, ZeroExt
+from claripy.backends.backend_concrete.bv import BVV, Concat, Extract, SDiv, SignExt, ZeroExt
 from claripy.errors import ClaripyTypeError, ClaripyValueError, ClaripyZeroDivisionError
 
 
@@ -45,8 +45,8 @@ class TestBv(unittest.TestCase):
         assert ~zero == 255
 
     def test_none_value(self):
-        a = claripy.ast.bv.TSI(8)
-        b = claripy.ast.bv.BVV(1, 8)
+        a = claripy.TSI(8)
+        b = claripy.BVV(1, 8)
         a.union(b)
         # If we get to this point, the test passed
 

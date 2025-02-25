@@ -1,6 +1,6 @@
-from typing import Any, overload
+from typing import overload
 
-from claripy.bv import BVV as ConcreteBVV
+from claripy.backends.backend_concrete.bv import BVV as ConcreteBVV
 from claripy.fp import RM, FSort
 
 from .bits import Bits
@@ -8,7 +8,6 @@ from .bool import Bool
 from .fp import FP
 
 CoerceBV = int | "BV"
-Incomplete = Any
 
 class BV(Bits):
     def chop(self, bits: int = 1) -> list[BV]: ...
@@ -88,19 +87,9 @@ class BV(Bits):
     def intersection(self, other: BV) -> BV: ...
     @property
     def concrete_value(self) -> int: ...
+    def __hash__(self) -> int: ...
 
-def BVS(
-    name: str,
-    size: int,
-    min=None,
-    max=None,
-    stride=None,
-    uninitialized=False,  # pylint:disable=redefined-builtin
-    explicit_name=None,
-    discrete_set=False,
-    discrete_set_max_card=None,
-    **kwargs,
-) -> BV: ...
+def BVS(name: str, size: int, **kwargs) -> BV: ...
 @overload
 def BVV(value: int, size: int = ..., **kwargs) -> BV: ...
 @overload
@@ -111,10 +100,6 @@ def SI(
     lower_bound: int | None = ...,
     upper_bound: int | None = ...,
     stride: int | None = ...,
-    to_conv: Incomplete | None = ...,
-    explicit_name: bool | None = ...,
-    discrete_set: bool = ...,
-    discrete_set_max_card: int | None = ...,
 ): ...
 def TSI(bits, name: str | None = ..., uninitialized: bool = ..., explicit_name: bool | None = ...): ...
 def ESI(bits, **kwargs): ...
@@ -124,21 +109,11 @@ def ValueSet(
     region_base_addr: int | None = ...,
     value: int | None = ...,
     name: str | None = ...,
-    val: Incomplete | None = ...,
+    val: int | None = ...,
 ): ...
 
 VS = ValueSet
 
-def DSIS(
-    name: Incomplete | None = ...,
-    bits: int = ...,
-    lower_bound: Incomplete | None = ...,
-    upper_bound: Incomplete | None = ...,
-    stride: Incomplete | None = ...,
-    explicit_name: Incomplete | None = ...,
-    to_conv: Incomplete | None = ...,
-    max_card: Incomplete | None = ...,
-): ...
 def ULT(a: BV | int, b: BV | int) -> Bool: ...
 def ULE(a: BV | int, b: BV | int) -> Bool: ...
 def UGT(a: BV | int, b: BV | int) -> Bool: ...

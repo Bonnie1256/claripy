@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 import itertools
+from typing import TYPE_CHECKING, TypeVar
 
-from . import ast, fp, simplifications
+import claripy
+import claripy.simplifications
+
 from . import debug as _d
 from .errors import ClaripyOperationError, ClaripyTypeError
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
-def op(name, arg_types, return_type, extra_check=None, calc_length=None, do_coerce=True):
-    if type(arg_types) in (tuple, list):  # pylint:disable=unidiomatic-typecheck
+    from claripy.ast import Base
+
+T = TypeVar("T", bound="Base")
+
+
+def op(name, arg_types, return_type: type[T], extra_check=None, calc_length=None) -> Callable[..., T]:
+    if isinstance(arg_types, tuple | list):
         expected_num_args = len(arg_types)
-    elif type(arg_types) is type:  # pylint:disable=unidiomatic-typecheck
+    elif isinstance(arg_types, type):
         expected_num_args = None
     else:
         raise ClaripyOperationError(f"op {name} got weird arg_types")
@@ -18,8 +28,8 @@ def op(name, arg_types, return_type, extra_check=None, calc_length=None, do_coer
     def _type_fixer(args):
         num_args = len(args)
         if expected_num_args is not None and num_args != expected_num_args:
-            if num_args + 1 == expected_num_args and arg_types[0] is fp.RM:
-                args = (fp.RM.default(), *args)
+            if num_args + 1 == expected_num_args and arg_types[0] is claripy.fp.RM:
+                args = (claripy.fp.RM.default(), *args)
             else:
                 raise ClaripyTypeError(f"Operation {name} takes exactly {len(arg_types)} arguments ({len(args)} given)")
 
@@ -27,11 +37,11 @@ def op(name, arg_types, return_type, extra_check=None, calc_length=None, do_coer
         matches = list(itertools.starmap(isinstance, zip(args, actual_arg_types, strict=False)))
 
         # heuristically, this works!
-        thing = args[matches.index(True, 1 if actual_arg_types[0] is fp.RM else 0)] if True in matches else None
+        thing = args[matches.index(True, 1 if actual_arg_types[0] is claripy.fp.RM else 0)] if True in matches else None
 
         for arg, argty, match in zip(args, actual_arg_types, matches, strict=False):
             if not match:
-                if do_coerce and hasattr(argty, "_from_" + type(arg).__name__):
+                if hasattr(argty, "_from_" + type(arg).__name__):
                     convert = getattr(argty, "_from_" + type(arg).__name__)
                     yield convert(thing, arg)
                 else:
@@ -52,20 +62,16 @@ def op(name, arg_types, return_type, extra_check=None, calc_length=None, do_coer
                     raise ClaripyOperationError(msg)
 
         # pylint:disable=too-many-nested-blocks
-        simp = _handle_annotations(simplifications.simplify(name, fixed_args), args)
+        simp, annotated = claripy.simplifications.simplify(name, fixed_args)
         if simp is not None:
-            return simp
+            if not annotated:
+                simp = _handle_annotations(simp, fixed_args)
+            if simp is not None:
+                return simp
 
         kwargs = {}
         if calc_length is not None:
             kwargs["length"] = calc_length(*fixed_args)
-
-        kwargs["uninitialized"] = None
-        # pylint:disable=isinstance-second-argument-not-valid-type
-        if any(a.uninitialized is True for a in args if isinstance(a, ast.Base)):
-            kwargs["uninitialized"] = True
-        if name in preprocessors:
-            args, kwargs = preprocessors[name](*args, **kwargs)
 
         return return_type(name, fixed_args, **kwargs)
 
@@ -74,11 +80,8 @@ def op(name, arg_types, return_type, extra_check=None, calc_length=None, do_coer
 
 
 def _handle_annotations(simp, args):
-    if simp is None:
-        return None
-
     # pylint:disable=isinstance-second-argument-not-valid-type
-    ast_args = tuple(a for a in args if isinstance(a, ast.Base))
+    ast_args = tuple(a for a in args if isinstance(a, claripy.ast.Base))
     preserved_relocatable = frozenset(simp._relocatable_annotations)
     relocated_annotations = set()
     bad_eliminated = 0
@@ -109,30 +112,6 @@ def reversed_op(op_func):
 
 
 #
-# Extra processors
-#
-
-union_counter = itertools.count()
-
-
-def preprocess_union(*args, **kwargs):
-    #
-    # When we union two values, we implicitly create a new symbolic, multi-valued
-    # variable, because a union is essentially an ITE with an unconstrained
-    # "choice" variable.
-    #
-
-    new_name = "union_%d" % next(union_counter)
-    kwargs["add_variables"] = frozenset((new_name,))
-    return args, kwargs
-
-
-preprocessors = {
-    "union": preprocess_union,
-    # 'intersection': preprocess_intersect
-}
-
-#
 # Length checkers
 #
 
@@ -156,7 +135,7 @@ def extract_check(high, low, bv):
     return True, ""
 
 
-def extend_check(amount, value):
+def extend_check(amount, _):
     return amount >= 0, "Extension length must be nonnegative"
 
 
@@ -168,58 +147,8 @@ def extract_length_calc(high, low, _):
     return high + 1 - low
 
 
-def str_basic_length_calc(str_1):
-    return str_1.length
-
-
-def int_to_str_length_calc(int_val):  # pylint: disable=unused-argument
-    return 8 * ast.String.MAX_LENGTH
-
-
-def str_replace_check(*args):
-    str_1, str_2, _ = args
-    if str_1.length < str_2.length:
-        return False, "The pattern that has to be replaced is longer than the string itself"
-    return True, ""
-
-
-def substr_length_calc(start_idx, count, strval):  # pylint: disable=unused-argument
-    # FIXME: How can I get the value of a concrete object without a solver
-    return strval.length if not count.concrete else 8 * count.args[0]
-
-
 def ext_length_calc(ext, orig):
     return orig.length + ext
-
-
-def str_concat_length_calc(*args):
-    return sum(arg.length for arg in args)
-
-
-def str_replace_length_calc(*args):
-    str_1, str_2, str_3 = args
-    # Return the maximum length that the string can assume after the replace
-    # operation
-    #
-    # If the part that has to be replaced if greater than
-    # the replacement than the we have the maximum length possible
-    # when the part that has to be replaced is not found inside the string
-    if str_2.length >= str_3.length:
-        return str_1.length
-    # Otherwise We have the maximum length when teh replacement happens
-    return str_1.length - str_2.length + str_3.length
-
-
-def strlen_bv_size_calc(s, bitlength):  # pylint: disable=unused-argument
-    return bitlength
-
-
-def strindexof_bv_size_calc(s1, s2, start_idx, bitlength):  # pylint: disable=unused-argument
-    return bitlength
-
-
-def strtoint_bv_size_calc(s, bitlength):  # pylint: disable=unused-argument
-    return bitlength
 
 
 #
@@ -357,6 +286,7 @@ backend_fp_cmp_operations = {
     "fpGT",
     "fpGEQ",
     "fpEQ",
+    "fpNEQ",
 }
 
 backend_fp_operations = {

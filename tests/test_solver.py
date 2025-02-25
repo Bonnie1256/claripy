@@ -1,12 +1,10 @@
 # pylint: disable=missing-class-docstring,no-self-use
 from __future__ import annotations
 
-import logging
 from unittest import TestCase, main
 
 import claripy
-
-l = logging.getLogger("claripy.test.solver")
+import claripy.frontend
 
 
 def raw_hybrid_solver(reuse_z3_solver):
@@ -14,8 +12,8 @@ def raw_hybrid_solver(reuse_z3_solver):
 
     s = claripy.SolverHybrid()
 
-    x = claripy.BVS("x", 32, min=0, max=10, stride=2)
-    y = claripy.BVS("y", 32, min=20, max=30, stride=5)
+    x = claripy.BVS("x", 32).annotate(claripy.annotation.StridedIntervalAnnotation(2, 0, 10))
+    y = claripy.BVS("y", 32).annotate(claripy.annotation.StridedIntervalAnnotation(5, 20, 30))
 
     # TODO: for now, the stride isn't respected in symbolic mode, but we'll fix that next.
     # until we do, let's add constraints
@@ -68,19 +66,19 @@ def raw_replacement_solver(reuse_z3_solver):
 
     y = claripy.BVS("y", 32)
     sr.add([y + 1 == 200])
-    assert (y + 1).cache_key in sr._replacements
+    assert (y + 1).hash() in sr._replacements
     assert sr._replacement(y + 1) is claripy.BVV(200, 32)
 
     srb = sr.branch()
     assert len(srb.constraints) == len(sr.constraints)  # pylint:disable=no-member
-    assert (y + 1).cache_key in sr._replacements
+    assert (y + 1).hash() in sr._replacements
     assert sr._replacement(y + 1) is claripy.BVV(200, 32)
 
     sr = claripy.SolverReplacement()
     b = claripy.BoolS("b")
     assert sr._replacement(b) is b
     sr.add(claripy.Not(b))
-    assert sr._replacement(b) is claripy.false
+    assert sr._replacement(b) is claripy.false()
 
     sr = claripy.SolverReplacement(claripy.SolverVSA(), complex_auto_replace=True)
     x = claripy.BVS("x", 64)
@@ -100,8 +98,6 @@ def raw_solver(solver_type, reuse_z3_solver):
     y = claripy.BVS("y", 32)
     z = claripy.BVS("z", 32)
 
-    l.debug("adding constraints")
-
     s.add(x == 10)
     s.add(y == 15)
 
@@ -112,7 +108,6 @@ def raw_solver(solver_type, reuse_z3_solver):
     assert results[0][1] == 16
     assert results[0][2] == 3
 
-    l.debug("checking")
     assert s.satisfiable()
     assert not s.satisfiable(extra_constraints=[x == 5])
     assert s.eval(x + 5, 1)[0] == 15
@@ -125,15 +120,15 @@ def raw_solver(solver_type, reuse_z3_solver):
     assert len(shards) == 2
     assert len(shards[0].variables) == 1
     assert len(shards[1].variables) == 1
-    if isinstance(s, claripy.frontend_mixins.ConstraintExpansionMixin) or (
-        isinstance(s, claripy.frontends.HybridFrontend)
-        and isinstance(s._exact_frontend, claripy.frontend_mixins.ConstraintExpansionMixin)
+    if isinstance(s, claripy.frontend.mixin.ConstraintExpansionMixin) or (
+        isinstance(s, claripy.frontend.HybridFrontend)
+        and isinstance(s._exact_frontend, claripy.frontend.mixin.ConstraintExpansionMixin)
     ):  # the hybrid frontend actually uses the exact frontend for the split
         assert {len(shards[0].constraints), len(shards[1].constraints)} == {
             2,
             1,
         }  # adds the != from the solution() check
-    if isinstance(s, claripy.frontends.ReplacementFrontend):
+    if isinstance(s, claripy.frontend.ReplacementFrontend):
         assert {len(shards[0].constraints), len(shards[1].constraints)} == {1}
 
     # test result caching
@@ -216,7 +211,7 @@ def raw_solver(solver_type, reuse_z3_solver):
 
     # test result caching
 
-    if isinstance(s, claripy.frontend_mixins.ModelCacheMixin):
+    if isinstance(s, claripy.frontend.mixin.ModelCacheMixin):
         count = claripy.backends.z3.solve_count
 
         s = solver_type()
@@ -251,7 +246,7 @@ def raw_solver_branching(solver_type, reuse_z3_solver):
     assert s.eval(x, 1)[0] > 0
 
     t = s.branch()
-    if isinstance(s, claripy.frontends.FullFrontend):
+    if isinstance(s, claripy.frontend.FullFrontend):
         assert s._tls.solver is t._tls.solver
         assert s._finalized
         assert t._finalized
@@ -339,7 +334,7 @@ def raw_composite_solver(reuse_z3_solver):
     c = claripy.And(x == 1, y == 2, z > 3)
     s.add(c)
 
-    if isinstance(s._template_frontend, claripy.frontend_mixins.ModelCacheMixin):
+    if isinstance(s._template_frontend, claripy.frontend.mixin.ModelCacheMixin):
         assert len(s._solver_list) == 3
         count = claripy.backends.z3.solve_count
         assert s.satisfiable()
@@ -409,10 +404,10 @@ def raw_ancestor_merge(solver, reuse_z3_solver):
     p.add(z == 1)
     q.add(z == 2)
 
-    r = p.merge([q], [claripy.true, claripy.true])[-1]
+    r = p.merge([q], [claripy.true(), claripy.true()])[-1]
     t = p.merge([q], [p.constraints[-1], q.constraints[-1]], common_ancestor=s)[-1]
 
-    if not isinstance(r, claripy.frontends.CompositeFrontend):
+    if not isinstance(r, claripy.frontend.CompositeFrontend):
         assert len(r.constraints) == 1
     assert len(t.constraints) == 3
     assert t.constraints[-1].variables == z.variables
@@ -454,7 +449,7 @@ class StandardTests(TestCase):
         x = claripy.BVS("x", 32)
         y = claripy.BVS("y", 32)
         z = claripy.BVS("z", 32)
-        str_1 = claripy.StringS("sym_str_1", 1024)
+        str_1 = claripy.StringS("sym_str_1")
         c = claripy.And(x == 1, y == 2, z == 3, str_1 == claripy.StringV("cavallo"))
         s.add(c)
         assert len(s._solver_list) == 4
@@ -489,7 +484,7 @@ class StandardTests(TestCase):
         s = claripy.Solver()
         s.add(x == 10)
         assert s.satisfiable()
-        s.add(claripy.false)
+        s.add(claripy.false())
         assert not s.satisfiable()
 
     def test_simplification_annotations(self):
