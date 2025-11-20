@@ -58,6 +58,10 @@ def if_simplifier(cond, if_true, if_false):
 
     if cond.is_false():
         return if_false
+
+    # if if_true.concrete and if_false.concrete and if_true.concrete_value == 1 and if_false.concrete_value == 0:
+    #     import ipdb; ipdb.set_trace()
+    #     return cond
     return None
 
 
@@ -318,6 +322,11 @@ def ne_simplifier(a, b):
             and a.args[0].args[0].args[0] == a.args[1].args[0]
         ):
             return a.args[0].args[1] & a.args[0].args[0] == 0
+
+    # c1 - expr != c2 --> expr != c1 - c2
+    if a.op == "__sub__" and len(a.args) == 2 and a.args[0].op == "BVV" and b.op == "BVV":
+        return a.args[1] != a.args[0] - b
+
 
     # Masking and comparing against a constant
     simp = and_mask_comparing_against_constant_simplifier(operator.__ne__, a, b)
@@ -759,6 +768,16 @@ def bitwise_and_simplifier(a, b, *args):
                 claripy.BVV(0, len(a.args[2])),
             )
 
+        # if(cond, iftrue, iffalse) & c -> if (cond, iftrue & c, iffalse & c)
+        if a.op == "If" and b.op == "BVV":
+            ifcond, iftrue, iffalse = a.args
+            if iftrue.op == "BVV" or iffalse.op == "BVV":
+                return claripy.If(
+                    a.args[0],
+                    a.args[1] & b,
+                    a.args[2] & b,
+                )
+
     return _flatten_simplifier("__and__", _deduplicate_filter, a, b, *args)
 
 
@@ -906,7 +925,7 @@ def extract_simplifier(high, low, val):
     #  (if cond then 1 else 0)[0:0]  ->  if(cond then 1[0:0] else 0[0:0])
     if val.op == "If":
         ifcond, iftrue, iffalse = val.args
-        if iftrue.op == "BVV" and iffalse.op == "BVV":
+        if iftrue.op == "BVV" or iffalse.op == "BVV":
             # extract from iftrue and iffalse
             return claripy.If(ifcond, iftrue[high:low], iffalse[high:low])
 
